@@ -9,14 +9,21 @@ from pdf2image import convert_from_path
 # Konfiguracja ścieżek
 PHOTOS_DIR = "photos"
 PROCESSED_DIR = "processed_photos"
+TEMP_DIR = "temp_results"
 OUTPUT_FILE = "result.md"
 MODEL_NAME = 'qwen3-vl:8b-instruct'
+
+# Lekko zmodyfikowany prompt ze "słowami-kluczami" ułatwiającymi weryfikację
+# QWEN_PROMPT = (
+#     "You are an expert OCR system. Extract all visible text from this image accurately."
+#     "Output ONLY the extracted TEXT. No conversational text."
+# )
 
 # Lekko zmodyfikowany prompt ze "słowami-kluczami" ułatwiającymi weryfikację
 QWEN_PROMPT = (
     "You are an expert OCR system. Extract all visible text from this image accurately.\n\n"
     "LAYOUT:\n"
-    "- Use standard Markdown (paragraphs, headings, lists).\n"
+    "- Use standard Markdown (paragraphs, headings, lists) - ignore bolded text - write in normal font\n"
     "- Use tables ONLY if explicit tabular data is present.\n"
     "- Use nested lists for non-linear layouts (mind maps, diagrams).\n\n"
     "UNCERTAIN TEXT RULES:\n"
@@ -126,8 +133,15 @@ def process_all_photos():
     if not os.path.exists(PROCESSED_DIR):
         os.makedirs(PROCESSED_DIR)
 
+    if not os.path.exists(TEMP_DIR):
+        os.makedirs(TEMP_DIR)
+
     clear_processed_dir(PROCESSED_DIR)
     print(f"🧹 Wyczyszczono folder '{PROCESSED_DIR}'.")
+
+    # Czyszczenie poprzednich tymczasowych plików
+    clear_processed_dir(TEMP_DIR)
+    print(f"🧹 Wyczyszczono folder '{TEMP_DIR}'.")
 
     valid_image_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
     valid_pdf_extensions = ('.pdf',)
@@ -146,98 +160,125 @@ def process_all_photos():
     print(f"\n🔎 Znaleziono {len(image_files)} obrazek(ów) i {len(pdf_files)} PDF(ów).")
     print(f"🚀 Uruchamiam procesowanie na AMD GPU...\n")
 
+    # Lista do przechowywania nazw tymczasowych plików (w kolejności)
+    temp_files_list = []
+
+    # --- PRZETWARZANIE OBRAZKÓW ---
+    for img_name in image_files:
+        img_path = os.path.join(PHOTOS_DIR, img_name)
+        print(f"\n⏳ Analiza obrazu: {img_name}...")
+
+        # Tworzymy tymczasowy plik dla tego obrazu
+        base_name = os.path.splitext(img_name)[0]
+        temp_file = os.path.join(TEMP_DIR, f"{base_name}_temp.md")
+
+        image_bytes = optimize_image_for_ai(img_path, img_name)
+
+        try:
+            response = ollama.generate(
+                model=MODEL_NAME,
+                prompt=QWEN_PROMPT,
+                images=[image_bytes]
+            )
+
+            extracted_text = response.get('response', '').strip()
+
+            # --- NOWY, INTELIGENTNY BEZPIECZNIK ---
+            if "> ⚠️ **Uwagi" in extracted_text:
+                parts = extracted_text.split("> ⚠️ **Uwagi")
+                main_text = parts[0]
+                footer = parts[1]
+                
+                # Jeśli stopka zawiera nasze angielskie tokeny sterujące (skopiowała pusty szablon)
+                # lub jest po prostu pusta, odcinamy ją.
+                is_fake_template = "DESCRIBE_POSITION_IN_POLISH" in footer or "uncertain_word" in footer or len(footer.strip()) < 5
+                
+                if is_fake_template:
+                    extracted_text = main_text.strip()
+            # --------------------------------------
+
+            # Piszemy do tymczasowego pliku
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                f.write(f"## 🖼️ Plik: `{img_name}`\n\n")
+                f.write(extracted_text)
+                f.write("\n\n---\n\n")
+
+            temp_files_list.append(temp_file)
+            print(f"✅ OCR Zakończono: {img_name}")
+
+        except Exception as e:
+            print(f"❌ Błąd modelu podczas przetwarzania {img_name}: {e}")
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                f.write(f"## 🖼️ Plik: `{img_name}`\n\n*Błąd OCR: {e}*\n\n---\n\n")
+            temp_files_list.append(temp_file)
+    
+    # --- PRZETWARZANIE PLIKÓW PDF ---
+    for pdf_name in pdf_files:
+        pdf_path = os.path.join(PHOTOS_DIR, pdf_name)
+        print(f"\n⏳ Przetwarzanie PDF: {pdf_name}...")
+        
+        # Tworzymy tymczasowy plik dla tego PDF
+        base_name = os.path.splitext(pdf_name)[0]
+        temp_file = os.path.join(TEMP_DIR, f"{base_name}_temp.md")
+        
+        page_images = process_pdf_pages(pdf_path, pdf_name)
+        
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            if not page_images:
+                f.write(f"## 📕 PDF: `{pdf_name}`\n\n*Błąd konwersji.*\n\n---\n\n")
+            else:
+                f.write(f"## 📕 PDF: `{pdf_name}`\n\n")
+                
+                for page_num, image_bytes in enumerate(page_images, 1):
+                    print(f"  ⏳ Analiza OCR strony {page_num}/{len(page_images)}...")
+                    
+                    try:
+                        response = ollama.generate(
+                            model=MODEL_NAME,
+                            prompt=QWEN_PROMPT,
+                            images=[image_bytes]
+                        )
+                        
+                        extracted_text = response.get('response', '').strip()
+                        
+                        # --- NOWY, INTELIGENTNY BEZPIECZNIK ---
+                        if "> ⚠️ **Uwagi" in extracted_text:
+                            parts = extracted_text.split("> ⚠️ **Uwagi")
+                            main_text = parts[0]
+                            footer = parts[1]
+                            
+                            is_fake_template = "DESCRIBE_POSITION_IN_POLISH" in footer or "uncertain_word" in footer or len(footer.strip()) < 5
+                            
+                            if is_fake_template:
+                                extracted_text = main_text.strip()
+                        # --------------------------------------
+                        
+                        f.write(f"### Strona {page_num}\n\n")
+                        f.write(extracted_text)
+                        f.write("\n\n")
+                        
+                        print(f"  ✅ Strona {page_num} gotowa")
+                        
+                    except Exception as e:
+                        print(f"  ❌ Błąd OCR na stronie {page_num}: {e}")
+                        f.write(f"### Strona {page_num}\n\n*Błąd OCR: {e}*\n\n")
+                
+                f.write("---\n\n")
+        
+        temp_files_list.append(temp_file)
+        print(f"✅ Zakończono cały plik: {pdf_name}")
+
+    # --- ŁĄCZENIE WSZYSTKICH TYMCZASOWYCH PLIKÓW W result.md ---
+    print(f"\n🔗 Łączenie tymczasowych plików...")
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as out_file:
         out_file.write(f"# 📄 Zbiorczy wynik OCR ({MODEL_NAME})\n\n")
-
-        # --- PRZETWARZANIE OBRAZKÓW ---
-        for img_name in image_files:
-            img_path = os.path.join(PHOTOS_DIR, img_name)
-            print(f"\n⏳ Analiza obrazu: {img_name}...")
-
-            image_bytes = optimize_image_for_ai(img_path, img_name)
-
-            try:
-                response = ollama.generate(
-                    model=MODEL_NAME,
-                    prompt=QWEN_PROMPT,
-                    images=[image_bytes]
-                )
-
-                extracted_text = response.get('response', '').strip()
-
-                # --- NOWY, INTELIGENTNY BEZPIECZNIK ---
-                if "> ⚠️ **Uwagi" in extracted_text:
-                    parts = extracted_text.split("> ⚠️ **Uwagi")
-                    main_text = parts[0]
-                    footer = parts[1]
-                    
-                    # Jeśli stopka zawiera nasze angielskie tokeny sterujące (skopiowała pusty szablon)
-                    # lub jest po prostu pusta, odcinamy ją.
-                    is_fake_template = "DESCRIBE_POSITION_IN_POLISH" in footer or "uncertain_word" in footer or len(footer.strip()) < 5
-                    
-                    if is_fake_template:
-                        extracted_text = main_text.strip()
-                # --------------------------------------
-
-                out_file.write(f"## 🖼️ Plik: `{img_name}`\n\n")
-                out_file.write(extracted_text)
-                out_file.write("\n\n---\n\n")
-
-                print(f"✅ OCR Zakończono: {img_name}")
-
-            except Exception as e:
-                print(f"❌ Błąd modelu podczas przetwarzania {img_name}: {e}")
-                out_file.write(f"## 🖼️ Plik: `{img_name}`\n\n*Błąd OCR: {e}*\n\n---\n\n")
         
-        # --- PRZETWARZANIE PLIKÓW PDF ---
-        for pdf_name in pdf_files:
-            pdf_path = os.path.join(PHOTOS_DIR, pdf_name)
-            print(f"\n⏳ Przetwarzanie PDF: {pdf_name}...")
-            
-            page_images = process_pdf_pages(pdf_path, pdf_name)
-            
-            if not page_images:
-                out_file.write(f"## 📕 PDF: `{pdf_name}`\n\n*Błąd konwersji.*\n\n---\n\n")
-                continue
-                
-            out_file.write(f"## 📕 PDF: `{pdf_name}`\n\n")
-            
-            for page_num, image_bytes in enumerate(page_images, 1):
-                print(f"  ⏳ Analiza OCR strony {page_num}/{len(page_images)}...")
-                
-                try:
-                    response = ollama.generate(
-                        model=MODEL_NAME,
-                        prompt=QWEN_PROMPT,
-                        images=[image_bytes]
-                    )
-                    
-                    extracted_text = response.get('response', '').strip()
-                    
-                    # --- NOWY, INTELIGENTNY BEZPIECZNIK ---
-                    if "> ⚠️ **Uwagi" in extracted_text:
-                        parts = extracted_text.split("> ⚠️ **Uwagi")
-                        main_text = parts[0]
-                        footer = parts[1]
-                        
-                        is_fake_template = "DESCRIBE_POSITION_IN_POLISH" in footer or "uncertain_word" in footer or len(footer.strip()) < 5
-                        
-                        if is_fake_template:
-                            extracted_text = main_text.strip()
-                    # --------------------------------------
-                    
-                    out_file.write(f"### Strona {page_num}\n\n")
-                    out_file.write(extracted_text)
-                    out_file.write("\n\n")
-                    
-                    print(f"  ✅ Strona {page_num} gotowa")
-                    
-                except Exception as e:
-                    print(f"  ❌ Błąd OCR na stronie {page_num}: {e}")
-                    out_file.write(f"### Strona {page_num}\n\n*Błąd OCR: {e}*\n\n")
-            
-            out_file.write("---\n\n")
-            print(f"✅ Zakończono cały plik: {pdf_name}")
+        for temp_file in temp_files_list:
+            try:
+                with open(temp_file, 'r', encoding='utf-8') as f:
+                    out_file.write(f.read())
+            except Exception as e:
+                print(f"⚠️ Błąd czytania pliku {temp_file}: {e}")
 
     print(f"\n🎉 Gotowe! Wszystkie wyniki zostały zapisane w pliku: {OUTPUT_FILE}")
 
